@@ -1,0 +1,16 @@
+[general]
+name=Renegade Buffer Tool
+qgisMinimumVersion=3.10
+description=Create vibroseis safe distance buffer shapefiles for POIs. Click a point or draw a line on the map to generate buffers with configurable distances per POI type.
+version=1.0.0
+author=Renegade Seismic
+email=steponthehenson@gmail.com
+about=Allows field staff to manually place accurate buffer polygons around POIs for vibroseis safe distance planning. Distances are editable and persist between sessions.
+tracker=
+repository=
+tags=buffer,vibroseis,seismic,POI,shapefile,safety
+homepage=
+category=Vector
+icon=icon.png
+experimental=False
+deprecated=False
