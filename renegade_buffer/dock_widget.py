@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import datetime
 
@@ -6,7 +7,8 @@ from qgis.PyQt.QtWidgets import (
     QDockWidget, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QTableWidget, QTableWidgetItem, QLabel,
     QLineEdit, QFileDialog, QHeaderView, QComboBox,
-    QAbstractItemView, QGroupBox, QMessageBox, QSizePolicy
+    QAbstractItemView, QGroupBox, QMessageBox, QListWidget,
+    QListWidgetItem, QSizePolicy
 )
 from qgis.PyQt.QtCore import Qt, QVariant
 from qgis.PyQt.QtGui import QColor
@@ -57,6 +59,28 @@ DEFAULT_POI_TYPES = [
 ]
 
 
+def _sanitize_name(name):
+    """Convert a POI display name into a safe filename stem."""
+    safe = re.sub(r"[^\w\s-]", "", name)
+    safe = re.sub(r"[\s/\\]+", "_", safe.strip())
+    safe = re.sub(r"_+", "_", safe).strip("_")
+    return safe or "unknown"
+
+
+def _next_shp_path(folder, poi_type):
+    """
+    Return a path like  <folder>/Bridge_001.shp  (next unused number).
+    Scans existing files so Bridge_001 and Bridge_002 are never overwritten.
+    """
+    base = _sanitize_name(poi_type)
+    n = 1
+    while True:
+        path = os.path.join(folder, f"{base}_{n:03d}.shp")
+        if not os.path.exists(path):
+            return path
+        n += 1
+
+
 class RenegadeBufferDock(QDockWidget):
 
     def __init__(self, canvas, parent=None):
@@ -64,10 +88,40 @@ class RenegadeBufferDock(QDockWidget):
         self.canvas = canvas
         self.active_tool = None
         self.prev_tool = None
-        self.buffer_layer = None
+        self.active_layer = None   # layer for the current activation session
         self.config = self._load_config()
         self._build_ui()
         self._populate_table()
+        QgsProject.instance().layersWillBeRemoved.connect(self._on_layers_will_be_removed)
+        self._refresh_file_list()
+        self.status_label.setText(
+            "Loaded " + datetime.datetime.now().strftime("%H:%M:%S")
+            + "  —  Select a POI type, then Activate Tool."
+        )
+
+    # ------------------------------------------------------------------
+    # Layer validity helpers
+    # ------------------------------------------------------------------
+
+    def _on_layers_will_be_removed(self, layer_ids):
+        """Clear active_layer reference before QGIS destroys the C++ object."""
+        if self.active_layer is None:
+            return
+        try:
+            if self.active_layer.id() in layer_ids:
+                self.active_layer = None
+        except RuntimeError:
+            self.active_layer = None
+
+    def _active_layer_valid(self):
+        """Return True only if active_layer exists and its C++ object is alive."""
+        if self.active_layer is None:
+            return False
+        try:
+            return self.active_layer.isValid()
+        except RuntimeError:
+            self.active_layer = None
+            return False
 
     # ------------------------------------------------------------------
     # Config persistence
@@ -78,7 +132,6 @@ class RenegadeBufferDock(QDockWidget):
             try:
                 with open(CONFIG_FILE, "r") as f:
                     data = json.load(f)
-                # Ensure required keys exist
                 if "poi_types" not in data:
                     data["poi_types"] = DEFAULT_POI_TYPES
                 if "output_folder" not in data:
@@ -129,13 +182,14 @@ class RenegadeBufferDock(QDockWidget):
         folder_grp = QGroupBox("Output Folder")
         folder_lay = QHBoxLayout(folder_grp)
         self.folder_edit = QLineEdit(self.config.get("output_folder", ""))
-        self.folder_edit.setPlaceholderText("Select folder for vibroseis_buffers.shp …")
+        self.folder_edit.setPlaceholderText("Select folder for shapefiles …")
         browse_btn = QPushButton("Browse")
         browse_btn.setFixedWidth(70)
         browse_btn.clicked.connect(self._browse_folder)
         folder_lay.addWidget(self.folder_edit)
         folder_lay.addWidget(browse_btn)
         layout.addWidget(folder_grp)
+        self.folder_edit.textChanged.connect(self._refresh_file_list)
 
         # --- POI table ---
         table_grp = QGroupBox("POI Types & Safe Distances  (double-click to edit)")
@@ -152,7 +206,7 @@ class RenegadeBufferDock(QDockWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.setMinimumHeight(340)
+        self.table.setMinimumHeight(300)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         table_lay.addWidget(self.table)
 
@@ -189,6 +243,31 @@ class RenegadeBufferDock(QDockWidget):
         )
         self.activate_btn.clicked.connect(self._toggle_tool)
         layout.addWidget(self.activate_btn)
+
+        # --- Created shapefiles list ---
+        files_grp = QGroupBox("Created Shapefiles")
+        files_lay = QVBoxLayout(files_grp)
+
+        self.file_list = QListWidget()
+        self.file_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.file_list.setMaximumHeight(130)
+        self.file_list.setMinimumHeight(60)
+        self.file_list.setAlternatingRowColors(True)
+        files_lay.addWidget(self.file_list)
+
+        file_btn_lay = QHBoxLayout()
+        delete_btn = QPushButton("Delete Selected")
+        delete_btn.setStyleSheet(
+            "QPushButton { background:#e53935; color:white; font-weight:bold; border-radius:4px; }"
+            "QPushButton:disabled { background:#bdbdbd; }"
+        )
+        delete_btn.clicked.connect(self._delete_selected_shp)
+        refresh_btn = QPushButton("Refresh List")
+        refresh_btn.clicked.connect(self._refresh_file_list)
+        file_btn_lay.addWidget(delete_btn)
+        file_btn_lay.addWidget(refresh_btn)
+        files_lay.addLayout(file_btn_lay)
+        layout.addWidget(files_grp)
 
         # --- Status ---
         self.status_label = QLabel("Select a POI type, then click Activate Tool.")
@@ -240,10 +319,95 @@ class RenegadeBufferDock(QDockWidget):
             self.folder_edit.setText(folder)
 
     def _on_row_selected(self):
-        # Deactivate tool when user switches POI type mid-session
         if self.activate_btn.isChecked():
             self._deactivate_tool()
             self.activate_btn.setChecked(False)
+
+    # ------------------------------------------------------------------
+    # File list helpers
+    # ------------------------------------------------------------------
+
+    def _refresh_file_list(self):
+        """Scan the output folder and repopulate the shapefiles list."""
+        self.file_list.clear()
+        folder = self.folder_edit.text().strip()
+        if not folder or not os.path.isdir(folder):
+            return
+        shp_files = sorted(
+            f for f in os.listdir(folder) if f.lower().endswith(".shp")
+        )
+        for fname in shp_files:
+            item = QListWidgetItem(fname)
+            item.setData(Qt.UserRole, os.path.join(folder, fname))
+            self.file_list.addItem(item)
+
+    def _delete_selected_shp(self):
+        """Delete the shapefile selected in the list from disk and QGIS."""
+        item = self.file_list.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Nothing Selected",
+                                    "Select a shapefile from the list first.")
+            return
+
+        shp_path = item.data(Qt.UserRole)
+        fname = item.text()
+
+        reply = QMessageBox.question(
+            self, "Delete Shapefile",
+            f"Permanently delete  {fname}  and all its sidecar files?\n\n"
+            "This cannot be undone.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        # Deactivate tool if it's writing to this file
+        if self.activate_btn.isChecked():
+            self._deactivate_tool()
+            self.activate_btn.setChecked(False)
+
+        # Remove from QGIS project if loaded — check active_layer first, then all layers
+        norm_path = shp_path.replace("\\", "/")
+        removed_active = False
+        try:
+            if (self.active_layer is not None
+                    and self.active_layer.source().replace("\\", "/") == norm_path):
+                QgsProject.instance().removeMapLayer(self.active_layer.id())
+                self.active_layer = None
+                removed_active = True
+        except RuntimeError:
+            self.active_layer = None
+            removed_active = True
+
+        if not removed_active:
+            for lid, lyr in list(QgsProject.instance().mapLayers().items()):
+                try:
+                    if lyr.source().replace("\\", "/") == norm_path:
+                        QgsProject.instance().removeMapLayer(lid)
+                        break
+                except RuntimeError:
+                    pass
+
+        # Delete sidecar files
+        base = os.path.splitext(shp_path)[0]
+        failed = []
+        for ext in (".shp", ".dbf", ".shx", ".prj", ".cpg", ".qmd", ".qpj", ".sbn", ".sbx"):
+            p = base + ext
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError as e:
+                    failed.append(f"{ext}: {e}")
+
+        if failed:
+            QMessageBox.warning(self, "Partial Delete",
+                                "Some files could not be deleted:\n" + "\n".join(failed))
+        else:
+            self.status_label.setText(f"Deleted: {fname}")
+            self.status_label.setStyleSheet("color:#555; font-style:italic;")
+
+        self._refresh_file_list()
 
     # ------------------------------------------------------------------
     # Parameter access (called by map tools on each click)
@@ -272,8 +436,11 @@ class RenegadeBufferDock(QDockWidget):
     # Layer management
     # ------------------------------------------------------------------
 
-    def _ensure_layer(self):
-        """Create or retrieve the output shapefile as a QGIS layer."""
+    def _create_new_layer(self, poi_type):
+        """
+        Create a brand-new numbered shapefile for poi_type and load it into QGIS.
+        Bridge_001.shp, Bridge_002.shp, etc. — never overwrites an existing file.
+        """
         folder = self.folder_edit.text().strip()
         if not folder:
             QMessageBox.warning(self, "No Output Folder",
@@ -284,50 +451,39 @@ class RenegadeBufferDock(QDockWidget):
                                 f"Folder does not exist:\n{folder}")
             return None
 
-        shp_path = os.path.join(folder, "vibroseis_buffers.shp")
+        shp_path = _next_shp_path(folder, poi_type)
+        fname = os.path.splitext(os.path.basename(shp_path))[0]
+        layer_name = f"{poi_type}  [{fname}]"
 
-        # Already loaded in this session?
-        if self.buffer_layer and self.buffer_layer.isValid():
-            return self.buffer_layer
+        fields = QgsFields()
+        fields.append(QgsField("poi_type", QVariant.String, "String", 80))
+        fields.append(QgsField("buffer_m",  QVariant.Int))
+        fields.append(QgsField("notes",     QVariant.String, "String", 200))
+        fields.append(QgsField("date",      QVariant.String, "String", 20))
 
-        # Already in the QGIS project?
-        for lyr in QgsProject.instance().mapLayers().values():
-            src = lyr.source().replace("\\", "/")
-            if src == shp_path.replace("\\", "/"):
-                self.buffer_layer = lyr
-                return lyr
+        writer = QgsVectorFileWriter(
+            shp_path, "UTF-8", fields,
+            QgsWkbTypes.Polygon,
+            QgsProject.instance().crs(),
+            "ESRI Shapefile"
+        )
+        err = writer.hasError()
+        msg = writer.errorMessage()
+        del writer
+        if err != QgsVectorFileWriter.NoError:
+            QMessageBox.critical(self, "Shapefile Error",
+                                 f"Could not create shapefile:\n{msg}")
+            return None
 
-        # Create a new shapefile if it doesn't exist yet
-        if not os.path.exists(shp_path):
-            fields = QgsFields()
-            fields.append(QgsField("poi_type", QVariant.String, "String", 80))
-            fields.append(QgsField("buffer_m",  QVariant.Int))
-            fields.append(QgsField("notes",     QVariant.String, "String", 200))
-            fields.append(QgsField("date",      QVariant.String, "String", 20))
-
-            writer = QgsVectorFileWriter(
-                shp_path, "UTF-8", fields,
-                QgsWkbTypes.Polygon,
-                QgsCoordinateReferenceSystem("EPSG:4326"),
-                "ESRI Shapefile"
-            )
-            err = writer.hasError()
-            msg = writer.errorMessage()
-            del writer  # must close before opening as layer
-            if err != QgsVectorFileWriter.NoError:
-                QMessageBox.critical(self, "Shapefile Error",
-                                     f"Could not create shapefile:\n{msg}")
-                return None
-
-        # Load into QGIS
-        layer = QgsVectorLayer(shp_path, "Vibroseis Buffers", "ogr")
+        layer = QgsVectorLayer(shp_path, layer_name, "ogr")
         if not layer.isValid():
             QMessageBox.critical(self, "Layer Error",
                                  f"Could not load shapefile:\n{shp_path}")
             return None
 
         QgsProject.instance().addMapLayer(layer)
-        self.buffer_layer = layer
+        self.active_layer = layer
+        self._refresh_file_list()
         return layer
 
     # ------------------------------------------------------------------
@@ -335,9 +491,9 @@ class RenegadeBufferDock(QDockWidget):
     # ------------------------------------------------------------------
 
     def _add_feature(self, buffered_geom, poi_type, distance, notes):
-        layer = self.buffer_layer
-        if layer is None or not layer.isValid():
+        if not self._active_layer_valid():
             return
+        layer = self.active_layer
 
         feat = QgsFeature(layer.fields())
         feat.setGeometry(buffered_geom)
@@ -356,6 +512,7 @@ class RenegadeBufferDock(QDockWidget):
                 f"Added: {poi_type}  ({distance} m buffer)  "
                 + ("— " + notes if notes else "")
             )
+            self.status_label.setStyleSheet("color:#555; font-style:italic;")
         else:
             self.status_label.setText("ERROR: feature could not be written.")
 
@@ -377,7 +534,7 @@ class RenegadeBufferDock(QDockWidget):
             self.activate_btn.setChecked(False)
             return
 
-        layer = self._ensure_layer()
+        layer = self._create_new_layer(name)
         if layer is None:
             self.activate_btn.setChecked(False)
             return
@@ -393,7 +550,7 @@ class RenegadeBufferDock(QDockWidget):
             self.active_tool = LineBufferTool(
                 self.canvas, self._get_params_for_tool, self._add_feature
             )
-            hint = "Left-click to add vertices. Right-click to finish. ESC to cancel current line."
+            hint = "Left-click to add vertices. Right-click to finish. ESC to cancel."
 
         self.canvas.setMapTool(self.active_tool)
         self.activate_btn.setText("Deactivate Tool")
@@ -408,6 +565,7 @@ class RenegadeBufferDock(QDockWidget):
             self.active_tool = None
         if self.prev_tool:
             self.canvas.setMapTool(self.prev_tool)
+        self.active_layer = None
         self.activate_btn.setText("Activate Tool")
         self.status_label.setText("Tool deactivated. Select a POI type and activate again.")
         self.status_label.setStyleSheet("color:#555; font-style:italic;")

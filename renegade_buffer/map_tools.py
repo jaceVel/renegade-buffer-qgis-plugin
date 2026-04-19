@@ -4,46 +4,49 @@ from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject
 )
 from qgis.PyQt.QtCore import Qt
-from qgis.PyQt.QtGui import QColor, QCursor
+from qgis.PyQt.QtGui import QColor
 
 
-def _get_utm_crs(lon):
-    """Return a UTM CRS (southern hemisphere) appropriate for the given longitude."""
-    zone = int((lon + 180) / 6) + 1
+def _get_utm_crs(geom_project_crs, project_crs):
+    """
+    Derive an appropriate UTM CRS by converting the geometry centroid to
+    geographic coordinates, then picking the matching UTM zone.
+    """
+    crs_4326 = QgsCoordinateReferenceSystem("EPSG:4326")
+    to_4326 = QgsCoordinateTransform(project_crs, crs_4326, QgsProject.instance())
+    centroid = geom_project_crs.centroid().asPoint()
+    pt = to_4326.transform(centroid)
+    zone = int((pt.x() + 180) / 6) + 1
     return QgsCoordinateReferenceSystem(f"EPSG:{32700 + zone}")
 
 
-def buffer_in_meters(geom_4326, distance_m, segments=64):
+def buffer_in_meters(geom, distance_m, segments=64):
     """
-    Buffer a WGS84 geometry by distance_m metres.
-    Internally reprojects to the appropriate UTM zone, buffers, then
-    reprojects back to EPSG:4326. Returns a new QgsGeometry.
+    Buffer a geometry (in the current project CRS) by distance_m metres.
+    Projects to UTM for accurate metric buffering, then returns the result
+    in the original project CRS so it can be written directly to the layer.
     """
-    centroid = geom_4326.centroid().asPoint()
-    crs_4326 = QgsCoordinateReferenceSystem("EPSG:4326")
-    crs_utm = _get_utm_crs(centroid.x())
+    project_crs = QgsProject.instance().crs()
+    crs_utm = _get_utm_crs(geom, project_crs)
 
-    to_utm = QgsCoordinateTransform(crs_4326, crs_utm, QgsProject.instance())
-    to_4326 = QgsCoordinateTransform(crs_utm, crs_4326, QgsProject.instance())
+    to_utm = QgsCoordinateTransform(project_crs, crs_utm, QgsProject.instance())
+    to_project = QgsCoordinateTransform(crs_utm, project_crs, QgsProject.instance())
 
-    geom = QgsGeometry(geom_4326)
-    geom.transform(to_utm)
-    buffered = geom.buffer(distance_m, segments)
-    buffered.transform(to_4326)
+    g = QgsGeometry(geom)
+    g.transform(to_utm)
+    buffered = g.buffer(distance_m, segments)
+    buffered.transform(to_project)
     return buffered
 
 
 class PointBufferTool(QgsMapTool):
-    """
-    Map tool: single left-click places a circular buffer polygon.
-    Each click immediately writes a feature to the output layer.
-    """
+    """Single left-click places a circular buffer polygon."""
 
     def __init__(self, canvas, get_params_fn, add_feature_fn):
         super().__init__(canvas)
         self.canvas = canvas
-        self.get_params = get_params_fn      # () -> (poi_type, distance, notes)
-        self.add_feature = add_feature_fn   # (geom, poi_type, distance, notes)
+        self.get_params = get_params_fn
+        self.add_feature = add_feature_fn
         self.setCursor(Qt.CrossCursor)
 
     def canvasPressEvent(self, event):
@@ -56,11 +59,7 @@ class PointBufferTool(QgsMapTool):
 
 
 class LineBufferTool(QgsMapTool):
-    """
-    Map tool: left-click adds vertices to a polyline; right-click
-    finishes and writes a buffered polygon around the line.
-    ESC cancels the current line without writing.
-    """
+    """Left-click adds vertices; right-click finishes and writes buffer. ESC cancels."""
 
     def __init__(self, canvas, get_params_fn, add_feature_fn):
         super().__init__(canvas)
@@ -68,8 +67,8 @@ class LineBufferTool(QgsMapTool):
         self.get_params = get_params_fn
         self.add_feature = add_feature_fn
         self.points = []
-        self.rb_committed = None   # solid line showing committed vertices
-        self.rb_preview = None     # dashed line from last vertex to cursor
+        self.rb_committed = None
+        self.rb_preview = None
         self.setCursor(Qt.CrossCursor)
 
     def activate(self):
@@ -80,10 +79,6 @@ class LineBufferTool(QgsMapTool):
     def deactivate(self):
         self._reset()
         super().deactivate()
-
-    # ------------------------------------------------------------------
-    # Rubber-band helpers
-    # ------------------------------------------------------------------
 
     def _init_rubber_bands(self):
         self.rb_committed = QgsRubberBand(self.canvas, QgsWkbTypes.LineGeometry)
@@ -107,10 +102,6 @@ class LineBufferTool(QgsMapTool):
         if self.rb_preview:
             self.rb_preview.reset()
 
-    # ------------------------------------------------------------------
-    # Event handlers
-    # ------------------------------------------------------------------
-
     def canvasPressEvent(self, event):
         if event.button() == Qt.LeftButton:
             point = self.toMapCoordinates(event.pos())
@@ -123,7 +114,6 @@ class LineBufferTool(QgsMapTool):
                 geom = QgsGeometry.fromPolylineXY(self.points)
                 buffered = buffer_in_meters(geom, distance)
                 self.add_feature(buffered, poi_type, distance, notes)
-            # Reset for next feature without deactivating the tool
             self.points = []
             if self.rb_committed:
                 self.rb_committed.reset()
